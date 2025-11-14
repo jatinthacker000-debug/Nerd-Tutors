@@ -1,37 +1,35 @@
-// api/evaluate.js - Vercel Serverless Function
-
+// api/evaluate.js
 export default async function handler(req, res) {
-  // Only allow POST requests
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-
-  // Enable CORS
-  res.setHeader('Access-Control-Allow-Credentials', true);
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  // Set CORS headers for all responses
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Origin', '*'); // change to your domain in production
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Handle OPTIONS request for CORS
+  // Handle preflight
   if (req.method === 'OPTIONS') {
-    return res.status(200).end();
+    return res.status(200).json({ ok: true });
+  }
+
+  // Only POST allowed
+  if (req.method !== 'POST') {
+    console.warn('Method not allowed:', req.method);
+    return res.status(405).json({ error: 'Method not allowed', method: req.method });
   }
 
   try {
-    const { question, modelAnswer, studentAnswer, maxMarks } = req.body;
+    const { question, modelAnswer, studentAnswer, maxMarks } = req.body ?? {};
 
-    // Validate input
-    if (!question || !studentAnswer || !maxMarks) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: question, studentAnswer, maxMarks' 
+    if (!question || !studentAnswer || typeof maxMarks === 'undefined') {
+      return res.status(400).json({
+        error: 'Missing required fields: question, studentAnswer, maxMarks',
+        received: { question: !!question, studentAnswer: !!studentAnswer, maxMarks: typeof maxMarks }
       });
     }
 
-    // Get API key from environment variable (set in Vercel)
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-    
     if (!GEMINI_API_KEY) {
-      console.error('GEMINI_API_KEY not found in environment');
+      console.error('GEMINI_API_KEY not set');
       return res.status(500).json({ error: 'API key not configured' });
     }
 
@@ -53,7 +51,8 @@ Respond ONLY with a valid JSON object (no markdown, no explanations, no code fen
 }
 `;
 
-    const response = await fetch(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
+    // Call Gemini
+    const apiRes = await fetch(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -62,72 +61,71 @@ Respond ONLY with a valid JSON object (no markdown, no explanations, no code fen
           temperature: 0.4,
           topK: 32,
           topP: 1,
-          maxOutputTokens: 1024,
-        },
-        safetySettings: [
-          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-        ]
+          maxOutputTokens: 1024
+        }
       })
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Gemini API error:', response.status, errorText);
-      throw new Error(`Gemini API error: ${response.status}`);
+    const apiText = await apiRes.text(); // read as text first
+    if (!apiRes.ok) {
+      console.error('Gemini returned non-OK:', apiRes.status, apiText);
+      return res.status(502).json({ error: 'Gemini API error', status: apiRes.status, body: apiText });
     }
 
-    const data = await response.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-    if (!text) {
-      throw new Error("Empty response from Gemini.");
-    }
-
-    // Clean and parse the response
-    const cleanText = text
-      .replace(/```json|```/g, '')
-      .replace(/\n/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    let result;
+    // Try parse JSON from the model output safely
+    let data;
     try {
-      result = JSON.parse(cleanText);
-    } catch (err) {
-      console.warn("Invalid JSON from Gemini:", cleanText);
+      data = JSON.parse(apiText);
+    } catch (e) {
+      // If Gemini returns structured response inside `candidates` like before, try that
+      try {
+        const parsed = JSON.parse(apiText);
+        data = parsed;
+      } catch (e2) {
+        // fallback: try to extract the JSON-like payload inside text (very defensive)
+        const match = apiText.match(/\{[\s\S]*\}/);
+        if (match) {
+          try { data = JSON.parse(match[0]); } 
+          catch (_) { data = null; }
+        } else {
+          data = null;
+        }
+      }
+    }
+
+    if (!data) {
+      // If no parse, return a helpful error so client can display it
+      console.warn('Could not parse Gemini output:', apiText);
       return res.status(200).json({
         score: 0,
-        improvements: [
-          "Response could not be parsed as JSON.",
-          "Try rephrasing or shortening the question.",
-          "AI output may have been incomplete or filtered."
-        ],
-        feedback: "Automatic evaluation failed. Please check manually."
+        improvements: ["Response could not be parsed as JSON.", "AI output may be incomplete or filtered."],
+        feedback: "Automatic evaluation failed. Please check manually.",
+        raw: apiText // useful for debugging
       });
     }
 
-    // Return successful result
+    // If the model returns nested structure, adapt accordingly:
+    // (handle older shape where candidates[0].content.parts[0].text was returned)
+    if (data.candidates && Array.isArray(data.candidates) && data.candidates[0]?.content) {
+      const text = data.candidates[0].content.parts[0].text || "";
+      try {
+        const parsed = JSON.parse(text);
+        data = parsed;
+      } catch (err) {
+        // keep original data if cannot parse
+      }
+    }
+
+    // Return shape client expects
     return res.status(200).json({
-      score: result.score ?? 0,
-      improvements: result.improvements ?? [],
-      feedback: result.feedback ?? "No feedback available."
+      score: data.score ?? 0,
+      improvements: data.improvements ?? [],
+      feedback: data.feedback ?? "No feedback available.",
+      rawData: data
     });
 
   } catch (error) {
-    console.error('Evaluation error:', error);
-    return res.status(500).json({
-      error: 'Evaluation failed',
-      message: error.message,
-      score: 0,
-      improvements: [
-        "Unable to evaluate due to processing error.",
-        "Possible issue: network, quota, or API filter.",
-        "Marked for manual review."
-      ],
-      feedback: "Evaluation failed due to an error."
-    });
+    console.error('Evaluation handler error:', error);
+    return res.status(500).json({ error: 'Evaluation failed', message: error.message });
   }
 }
